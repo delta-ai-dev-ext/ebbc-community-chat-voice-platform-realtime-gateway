@@ -1,0 +1,277 @@
+schema_version: 2
+diagram_id: realtime-gateway-service
+mode: service
+orientation: LR
+scope: realtime_gateway service view; inbound sockets and probes, Kafka broadcast
+  consumption, synchronous scope resolution.
+sources:
+- path: docs/architecture.md
+  sha256: 083d3176aeec6bfc9ca3aaf7e736d80976fd232fd7ac72323abf4afde144a30b
+- path: docs/openapi_spec.yaml
+  sha256: 11c677aab7fc3ef21e4309d6b1ebae76820b1c82d8df1e74181524533a7508d7
+- path: docs/user_stories.md
+  sha256: 21024a11e2c839b0da7e2f4febf1b74ea542e6b6b8098ef8fb510a3e82007d51
+entities:
+- id: client
+  label: Browser web client
+  kind: annotation
+  role: inbound
+  row: 470
+  evidence:
+  - path: docs/architecture.md
+    quote: Terminate one WebSocket per browser tab.
+- id: lb
+  label: Load balancer
+  kind: annotation
+  role: inbound
+  row: 540
+  evidence:
+  - path: docs/openapi_spec.yaml
+    quote: Liveness and readiness probes
+  - path: docs/user_stories.md
+    quote: the gateway reports itself not ready
+- id: svc
+  name: realtime_gateway
+  label: realtime_gateway
+  kind: service
+  technology: kubernetes-pod
+  role: service
+  row: 540
+  evidence:
+  - path: docs/architecture.md
+    quote: WebSocket push gateway for the Community Chat & Voice Platform.
+  - path: docs/architecture.md
+    quote: '### Synchronous — API-003 (caller: `realtime_gateway` → provider: `messaging_service`)'
+- id: kafka
+  name: kafka
+  label: Kafka broker
+  kind: broker
+  technology: kafka
+  role: outbound
+  row: 60
+  evidence:
+  - path: docs/architecture.md
+    quote: Kafka broker unavailability
+  - path: docs/architecture.md
+    quote: '| `kafka_consumer_lag` | `topic`, `consumer_group` |'
+- id: msvc
+  name: messaging_service
+  label: messaging_service
+  kind: annotation
+  role: sync-only
+  row: 610
+  evidence:
+  - path: docs/architecture.md
+    quote: 'provider: `messaging_service`'
+relationships:
+- id: r-client
+  source: client
+  target: svc
+  type: request
+  interaction:
+    channel: direct
+    purpose: live event stream
+    protocol: WebSocket
+    exchange_id: ws-live-stream
+  evidence:
+  - path: docs/architecture.md
+    quote: Terminate one WebSocket per browser tab.
+- id: r-lb
+  source: lb
+  target: svc
+  type: request
+  interaction:
+    channel: direct
+    purpose: health and readiness probes
+    exchange_id: health-probes
+  evidence:
+  - path: docs/openapi_spec.yaml
+    quote: Liveness and readiness probes
+- id: r-scopes
+  source: svc
+  target: msvc
+  type: request
+  interaction:
+    channel: direct
+    purpose: subscription scope resolution
+    protocol: REST
+    exchange_id: user-scopes
+  evidence:
+  - path: docs/architecture.md
+    quote: 'provider: `messaging_service`'
+  - path: docs/architecture.md
+    quote: '| Kind | REST |'
+  - path: docs/architecture.md
+    quote: '| Operation | `POST /internal/realtime/user-scopes` |'
+- id: r-cons-message
+  source: kafka
+  target: svc
+  type: event
+  interaction:
+    channel: messaging
+    purpose: message snapshots
+    protocol: Kafka
+  messaging:
+    role: consumer
+    topic: message_events
+  evidence:
+  - path: docs/architecture.md
+    quote: '#### EVT-009 — `message_changed` v1 (topic `message_events`)'
+  - path: docs/architecture.md
+    quote: '| Consumers | `realtime_gateway`, `notification_service` |'
+  - path: docs/architecture.md
+    quote: 'Kafka-to-socket delivery p95 target: < 150 ms; consumer lag p95 target:
+      < 500 ms.'
+- id: r-cons-voice
+  source: kafka
+  target: svc
+  type: event
+  interaction:
+    channel: messaging
+    purpose: voice presence snapshots
+    protocol: Kafka
+  messaging:
+    role: consumer
+    topic: voice_events
+  evidence:
+  - path: docs/architecture.md
+    quote: '#### EVT-010 — `voice_presence_changed` v1 (topic `voice_events`)'
+  - path: docs/architecture.md
+    quote: '| Consumers | `realtime_gateway` |'
+  - path: docs/architecture.md
+    quote: 'Kafka-to-socket delivery p95 target: < 150 ms; consumer lag p95 target:
+      < 500 ms.'
+- id: r-cons-community
+  source: kafka
+  target: svc
+  type: event
+  interaction:
+    channel: messaging
+    purpose: membership and channel snapshots
+    protocol: Kafka
+  messaging:
+    role: consumer
+    topic: community_events
+  evidence:
+  - path: docs/architecture.md
+    quote: '#### EVT-002 — `community_member_changed` v1 (topic `community_events`)'
+  - path: docs/architecture.md
+    quote: '| Consumers | `messaging_service`, `voice_service`, `realtime_gateway`
+      |'
+  - path: docs/architecture.md
+    quote: 'Kafka-to-socket delivery p95 target: < 150 ms; consumer lag p95 target:
+      < 500 ms.'
+- id: r-cons-social
+  source: kafka
+  target: svc
+  type: event
+  interaction:
+    channel: messaging
+    purpose: conversation snapshots
+    protocol: Kafka
+  messaging:
+    role: consumer
+    topic: social_events
+  evidence:
+  - path: docs/architecture.md
+    quote: '#### EVT-008 — `conversation_changed` v1 (topic `social_events`)'
+  - path: docs/architecture.md
+    quote: '| Consumers | `messaging_service`, `realtime_gateway` |'
+  - path: docs/architecture.md
+    quote: 'Kafka-to-socket delivery p95 target: < 150 ms; consumer lag p95 target:
+      < 500 ms.'
+- id: r-cons-notification
+  source: kafka
+  target: svc
+  type: event
+  interaction:
+    channel: messaging
+    purpose: in-app notification snapshots
+    protocol: Kafka
+  messaging:
+    role: consumer
+    topic: notification_events
+  evidence:
+  - path: docs/architecture.md
+    quote: '#### EVT-011 — `notification_created` v1 (topic `notification_events`)'
+  - path: docs/architecture.md
+    quote: '| Consumers | `realtime_gateway` |'
+  - path: docs/architecture.md
+    quote: 'Kafka-to-socket delivery p95 target: < 150 ms; consumer lag p95 target:
+      < 500 ms.'
+view:
+  entities:
+  - client
+  - lb
+  - svc
+  - kafka
+  - msvc
+  groups: []
+  edges:
+  - id: e-client
+    source: client
+    target: svc
+    relationships:
+    - r-client
+    label: WebSocket
+    flow: forward
+  - id: e-lb
+    source: lb
+    target: svc
+    relationships:
+    - r-lb
+    label: probes
+    flow: forward
+  - id: e-cons-message
+    source: kafka
+    target: svc
+    relationships:
+    - r-cons-message
+    label: 'Consumers
+
+      realtime_gateway:message_events'
+    flow: feedback
+  - id: e-cons-voice
+    source: kafka
+    target: svc
+    relationships:
+    - r-cons-voice
+    label: 'Consumers
+
+      realtime_gateway:voice_events'
+    flow: feedback
+  - id: e-cons-community
+    source: kafka
+    target: svc
+    relationships:
+    - r-cons-community
+    label: 'Consumers
+
+      realtime_gateway:community_events'
+    flow: feedback
+  - id: e-cons-social
+    source: kafka
+    target: svc
+    relationships:
+    - r-cons-social
+    label: 'Consumers
+
+      realtime_gateway:social_events'
+    flow: feedback
+  - id: e-cons-notification
+    source: kafka
+    target: svc
+    relationships:
+    - r-cons-notification
+    label: 'Consumers
+
+      realtime_gateway:notification_events'
+    flow: feedback
+  - id: e-scopes
+    source: svc
+    target: msvc
+    relationships:
+    - r-scopes
+    label: REST
+    flow: forward
+  omitted: []

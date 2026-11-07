@@ -1,1 +1,194 @@
-# ebbc-community-chat-voice-platform-realtime-gateway
+# realtime_gateway
+
+WebSocket push gateway for the Community Chat & Voice Platform. It terminates one
+authenticated WebSocket per browser tab, resolves the caller's subscription scopes, and fans
+out every live platform event to the sockets whose scopes match. It owns no database, persists
+no state and produces no events: a replica is a stateless fan-out pipe that can be scaled out
+or killed at any time (clients simply reconnect).
+
+Specifications live in [`docs/`](docs): `architecture.md` (flows and contracts),
+`engineering_guide.md` (libraries, conventions, configuration), `openapi_spec.yaml` (HTTP
+surface) and `user_stories.md` (US-001…US-012).
+
+## What it does
+
+- **Local token verification.** Access tokens are verified with identity's public keys
+  (current + next for rotation) supplied through configuration. Only asymmetric algorithms
+  are accepted; `exp`, `iss`, `aud` are validated and `sub`/`sid` are extracted. No call to
+  `identity_service` happens at connect or refresh time.
+- **Scope resolution (API-003).** Before the upgrade the gateway calls
+  `POST /internal/realtime/user-scopes` on `messaging_service` with the internal service
+  token (2 s timeout, one retry on `5xx`/timeout, `traceparent`/`X-Trace-Id` propagated) and
+  subscribes the connection to `user:{id}`, `community:{id}` and `conversation:{id}`.
+- **Broadcast consumption.** One consumer per topic (`message_events`, `voice_events`,
+  `community_events`, `social_events`, `notification_events`) assigns all partitions manually,
+  starts at the latest offset, commits nothing and joins no consumer group. Duplicates are
+  dropped on `envelope.event_id`, so an event reaches a socket at most once and history is
+  never replayed.
+- **Scope-aware fan-out.** Events are pushed as `{type, scope, data}` frames. Membership and
+  conversation events also maintain live subscriptions, so joining, leaving, being banned or
+  being added to a group conversation takes effect without a reconnect.
+- **Connection hygiene.** Server pings with pong-extended read deadlines, heartbeat
+  acknowledgements, in-band token refresh, close code 4401 when the token expires without a
+  refresh, and a bounded per-socket send buffer that drops (and counts) frames for slow
+  consumers.
+
+### Event routing
+
+| Event (topic) | Frame scope |
+|---|---|
+| `message_changed` (`message_events`) | `community:{community_id}` when set, else `conversation:{container_id}` |
+| `voice_presence_changed` (`voice_events`) | `community:{community_id}` |
+| `community_member_changed` (`community_events`) | `community:{community_id}`; `joined`/active `unbanned` add the scope, `left`/`removed`/`banned` drop it before the snapshot is broadcast |
+| `community_channel_changed` (`community_events`) | `community:{community_id}` |
+| `conversation_changed` (`social_events`) | `conversation:{conversation_id}`; `added_user_ids` are subscribed, `removed_user_ids` unsubscribed before the broadcast |
+| `notification_created` (`notification_events`) | `user:{recipient_user_id}` |
+
+Unknown event types or versions and malformed envelopes are logged (with `trace_id`) and
+dropped; the consumer loop never dies on a bad message.
+
+### Close codes
+
+| Code | Reason | When |
+|---|---|---|
+| `4400` | `protocol_violation` | client sent anything other than `heartbeat` / `refresh_token` |
+| `4401` | `token_expired` | access token expired without a successful in-band refresh |
+| `4402` | `invalid_token` | missing, malformed or unverifiable access token |
+| `4503` | `service_unavailable` | retryable: API-003 unavailable, feed detached, replica draining |
+| `1001` | `going_away` | graceful shutdown (buffered frames are flushed first) |
+| `1013` | `slow_consumer` | socket kept overflowing its bounded send buffer |
+
+Authentication and scope resolution happen **before** the upgrade. A real WebSocket handshake
+that must be refused is upgraded and immediately closed with the machine-readable code above,
+so the browser learns why; a plain HTTP request to `/ws` receives the OpenAPI status instead
+(`400` missing token, `401` invalid/expired, `503` not ready) with an `ErrorResponse` body.
+
+## Layout
+
+```
+realtime_gateway/
+├── cmd/server/main.go          # config, wiring, signal handling, graceful drain
+├── internal/
+│   ├── config/                 # typed env config, validated at startup (fail fast)
+│   ├── contracts/              # envelope + the six consumed payload structs (docs §4)
+│   ├── models/                 # scopes, frames, client control messages, close codes
+│   ├── gateway/                # hub/registry, scope matcher, dedupe, pipeline, Kafka feed, metrics
+│   ├── service/                # token verifier + keys, API-003 client, socket lifecycle
+│   └── handler/                # /ws upgrade gate, /healthz, /readyz, /metrics, RED middleware
+├── tests/
+│   ├── unit/                   # scopes, routing, dedupe, tokens, scope client, session, feed, config
+│   ├── integration/            # upgrade → scope → fan-out → drain over real sockets
+│   └── mocks/                  # (fakes are declared next to the tests that use them)
+├── Makefile, Dockerfile, docker-compose.yml, .env.example
+└── docs/
+```
+
+## Build
+
+```bash
+make install     # go mod download (always first in a cold workspace)
+go build ./cmd/server
+make build       # Docker image: golang:1.26-alpine builder → distroless static, non-root
+```
+
+`make build` needs a Docker daemon; the produced image runs as `nonroot:nonroot` from
+`gcr.io/distroless/static-debian12` with a static, `-trimpath` binary.
+
+## Run
+
+```bash
+cp .env.example .env          # local development only; production uses plain env vars
+make run                      # go run ./cmd/server
+```
+
+Configuration is validated at startup: a missing or malformed variable aborts the process with
+a structured log that names every offending variable (all problems are reported together).
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `PORT` | yes | HTTP port for `/ws`, probes and `/metrics` |
+| `KAFKA_BROKERS` | yes | Comma separated bootstrap brokers |
+| `KAFKA_SASL_MECHANISM` / `KAFKA_SASL_USER` / `KAFKA_SASL_PASSWORD` / `KAFKA_TLS_ENABLED` | no | Broker auth when the cluster requires it |
+| `MESSAGING_SERVICE_URL` | yes | Base URL of `messaging_service` (API-003) |
+| `INTERNAL_SERVICE_TOKEN` | yes | Service token sent as `Authorization: Bearer` |
+| `IDENTITY_JWKS` (inline document or file path) or `IDENTITY_PUBLIC_KEY_PATH` + `IDENTITY_NEXT_PUBLIC_KEY_PATH` | yes | identity verification keys |
+| `IDENTITY_TOKEN_ISSUER` / `IDENTITY_TOKEN_AUDIENCE` | yes | Expected `iss` / `aud` |
+| `WS_ALLOWED_ORIGINS` | yes | Comma separated origin allow-list (`*` allowed, never in production) |
+| `WS_HEARTBEAT_INTERVAL` (25s) / `WS_READ_DEADLINE` (60s) | no | Ping interval and silence deadline |
+| `WS_SEND_BUFFER_SIZE` (64) | no | Per-connection outbound frame buffer |
+| `EVENT_DEDUPE_TTL` (600s) | no | `event_id` dedupe retention window |
+| `SHUTDOWN_TIMEOUT` (20s) | no | Bounded drain window |
+
+Durations accept plain seconds (`30`) or a Go duration (`30s`). `LOG_LEVEL=debug` enables
+debug logs locally. Secrets (`INTERNAL_SERVICE_TOKEN`, SASL password, key material) are never
+logged.
+
+### Endpoints
+
+| Path | Purpose |
+|---|---|
+| `GET /ws` | WebSocket upgrade (`access_token` query parameter or `Authorization: Bearer`) |
+| `GET /healthz` | Liveness: always `200 {"status":"ok"}` while the process is responsive; it never probes Kafka or messaging_service |
+| `GET /readyz` | Readiness: `200` only when the feed is attached and the scope client is configured; `503` while draining or detached |
+| `GET /metrics` | Prometheus exposition |
+
+### Client protocol
+
+Server → client frames are `{"type": "<event_type>", "scope": "<kind>:<uuid>", "data": {...}}`.
+Client → server traffic is limited to:
+
+```json
+{"type": "heartbeat"}
+{"type": "refresh_token", "access_token": "<jwt>"}
+```
+
+`heartbeat` is answered with `{"type":"heartbeat_ack","ok":true}`. A successful refresh answers
+`{"type":"refresh_token_ack","ok":true}` and re-associates the connection with the new token;
+a rejected refresh answers `ok:false` with `invalid_token`/`token_expired`, keeps the previous
+token and closes the socket (4401) only when that token expires. Every other message closes
+the connection with 4400.
+
+### Metrics
+
+`realtime_connections_active`, `realtime_connections_opened_total{result}`,
+`realtime_events_delivered_total{event_type}`, `realtime_reconnects_total`,
+`realtime_dropped_frames_total{event_type}`, `http_requests_total{route,method,status_class}`,
+`http_request_duration_seconds{route,method}` and
+`kafka_consumer_lag{topic,consumer_group="broadcast"}`. All labels are low cardinality: user,
+community, conversation and message ids never appear in metrics or logs, and the
+`access_token` query parameter is scrubbed from every log line.
+
+### Shutdown
+
+On `SIGTERM`/`SIGINT`: `/readyz` flips to `503`, new upgrades are refused, buffered frames are
+flushed, every socket is closed with `1001 going away`, the feed consumers stop and the process
+exits `0` within `SHUTDOWN_TIMEOUT` (a watchdog guarantees the bound).
+
+## Local dependencies (Compose, documented only)
+
+`docker-compose.yml` starts a single-node Kafka-compatible broker (Redpanda) and creates the
+five topics. It is **not** used by the test suite and is not executed by CI:
+
+```bash
+docker compose up -d
+export KAFKA_BROKERS=localhost:9092
+make run
+```
+
+You also need a `messaging_service` exposing `/internal/realtime/user-scopes` and the
+identity public keys (PEM files or a JWKS document) for tokens to be accepted.
+
+## Testing
+
+```bash
+make test        # go test ./... -race -count=1 -parallel 4
+make coverage    # adds -coverprofile=coverage.out and prints the function level report
+make lint        # golangci-lint run ./...
+```
+
+The suite is fully self-contained: no broker, no Docker, no network egress. Unit tests cover
+scope matching and add/drop semantics, dedupe, token verification decisions, close codes,
+refresh handling and the Kafka feed's attach/detach/lag paths with an injected clock and fake
+partition consumers. Integration tests drive the real upgrade → scope → fan-out → drain path
+over `httptest` sockets with a fake event feed and a fake (or `httpmock`-stubbed) scope
+resolver, including duplicate suppression and live membership changes.
