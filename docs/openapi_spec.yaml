@@ -1,0 +1,293 @@
+openapi: "3.0.3"
+info:
+  title: realtime_gateway API
+  version: "1.0.0"
+  description: >
+    WebSocket push gateway for the community chat & voice platform. It authenticates
+    browsers over a WebSocket upgrade, resolves the caller's live-event subscription
+    scopes, and pushes every matching live event (messages, voice presence, community
+    membership/channel changes, conversation changes, notifications) as JSON frames.
+    The gateway is stateless: subscription state lives only on the connection and is
+    rebuilt on reconnect. It consumes platform event topics as a broadcast reader and
+    produces nothing.
+
+servers:
+  - url: /
+
+tags:
+  - name: websocket
+    description: Live event stream (WebSocket upgrade)
+  - name: probes
+    description: Liveness and readiness probes
+
+paths:
+  /ws:
+    get:
+      operationId: connectWebSocket
+      summary: Open the live event stream (WebSocket upgrade)
+      description: >
+        Upgrades the HTTP connection to a WebSocket. Authentication is performed
+        before the upgrade: browsers that cannot set headers on a WebSocket
+        handshake pass the short-lived access token via the `access_token` query
+        parameter (the parameter is scrubbed from all logs); non-browser clients
+        may use `Authorization: Bearer <access_token>` instead.
+        Access tokens are JWTs issued by `identity_service` and verified locally
+        with the platform's public verification keys (claims: `sub`, `sid`,
+        `email_verified`, `exp`, `iat`, `iss`, `aud`).
+        On success the gateway resolves the user's subscription scopes
+        (communities and private conversations via the internal scopes endpoint),
+        subscribes the connection to those scopes plus the user's personal scope,
+        and starts pushing event frames `{type, scope, data}`. Client-to-server
+        traffic is limited to heartbeats and in-band token refresh; any other
+        inbound message closes the connection with close code 4400 (protocol
+        violation). Connections whose token expires without an in-band refresh are
+        closed with close code 4401 (`token_expired`). The gateway never replays
+        history; clients catch up via the messaging REST history `after` cursor.
+      tags: [websocket]
+      parameters:
+        - name: access_token
+          in: query
+          required: false
+          description: >
+            Short-lived access token (JWT) for browser WebSocket handshakes.
+            Preferred over the query parameter for non-browser clients is the
+            Authorization header. Never logged.
+          schema:
+            type: string
+            minLength: 1
+        - name: Authorization
+          in: header
+          required: false
+          description: >
+            Alternative to the query parameter: `Bearer <access_token>`.
+          schema:
+            type: string
+      responses:
+        "101":
+          description: >
+            WebSocket protocol switch accepted. From this point the connection
+            carries JSON event frames from server to client (see
+            `EventFrame`); client-to-server frames are limited to
+            `heartbeat` and `refresh_token` control messages.
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "503":
+          $ref: '#/components/responses/ServiceUnavailable'
+        "500":
+          $ref: '#/components/responses/InternalError'
+  /healthz:
+    get:
+      operationId: getLiveness
+      summary: Liveness probe
+      description: >
+        Lightweight check that the process is responsive. MUST NOT fail on
+        transient downstream problems (Kafka reconnects, scope-service hiccups).
+      tags: [probes]
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        "500":
+          $ref: '#/components/responses/InternalError'
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: Readiness probe
+      description: >
+        Returns 200 only when the gateway is fully operational: the live-event
+        feed is attached (Kafka partitions for all subscribed topics are assigned
+        on this replica) and the scope-service client is configured. Returns 503
+        once graceful shutdown has started or the feed is detached.
+      tags: [probes]
+      responses:
+        "200":
+          description: Ready to accept WebSocket connections
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        "503":
+          description: >
+            Not ready: feed not attached, shutdown in progress, or required
+            configuration missing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Short-lived access token issued by identity_service (~10 min lifetime,
+        asymmetric signature), verified locally with the platform's public
+        verification keys.
+
+  responses:
+    BadRequest:
+      description: Malformed request (e.g. invalid query parameter or missing token)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Missing, malformed, expired, or invalid access token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ServiceUnavailable:
+      description: >
+        Gateway cannot accept connections right now (scope resolution
+        unavailable, feed not attached, or draining for shutdown). Retryable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      description: >
+        Platform-wide error body. `error` is a stable machine-readable code;
+        `detail` is human-readable text.
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code, snake_case.
+          example: "invalid_token"
+        detail:
+          type: string
+          description: Human-readable explanation.
+
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        detail:
+          type: string
+          description: Optional human-readable context (e.g. which dependency is not ready).
+
+    ScopeType:
+      type: string
+      description: >
+        Kind of subscription scope a frame belongs to. A scope id is
+        `<scope_type>:<uuid>` for community and conversation scopes and
+        `user:<uuid>` for the personal user scope.
+      enum: [community, conversation, user]
+
+    EventType:
+      type: string
+      description: >
+        Live event type pushed on the socket. Mirrors the platform event types
+        the gateway consumes. New event types may be added without a contract
+        break; clients must ignore unknown types.
+      enum:
+        - message_changed
+        - voice_presence_changed
+        - community_member_changed
+        - community_channel_changed
+        - conversation_changed
+        - notification_created
+
+    EventFrame:
+      type: object
+      required: [type, scope, data]
+      description: >
+        One server-pushed live event. `type` identifies the event kind, `scope`
+        the subscription scope it was matched against (`<scope_type>:<uuid>`),
+        and `data` the event payload snapshot (the consumed event's `payload`
+        object, carried as-is). Frames never replay history: an event is pushed
+        at most once per connection.
+      properties:
+        type:
+          $ref: '#/components/schemas/EventType'
+        scope:
+          type: string
+          description: >
+            Scope the frame was matched on: `community:<community_id>`,
+            `conversation:<conversation_id>`, or `user:<user_id>`.
+          example: "community:5f0b8d2e-1c4a-4d3e-9a7b-2e6f1a9c0d12"
+        data:
+          type: object
+          description: >
+            Payload of the underlying event, carried as-is from the platform
+            event contract (message snapshot, presence snapshot, member/channel
+            snapshot, conversation snapshot, or notification payload).
+          additionalProperties: true
+
+    ClientMessageType:
+      type: string
+      description: >
+        The only client-to-server messages accepted on the socket. Everything
+        else is a protocol violation.
+      enum: [heartbeat, refresh_token]
+
+    ClientHeartbeat:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [heartbeat]
+
+    ClientRefreshToken:
+      type: object
+      required: [type, access_token]
+      properties:
+        type:
+          type: string
+          enum: [refresh_token]
+        access_token:
+          type: string
+          description: New short-lived access token, verified like the connect token.
+
+    ClientAck:
+      type: object
+      required: [type, ok]
+      properties:
+        type:
+          type: string
+          enum: [heartbeat_ack, refresh_token_ack]
+        ok:
+          type: boolean
+        error:
+          type: string
+          description: Present when ok is false (e.g. `invalid_token`).
+
+    CloseReason:
+      type: object
+      required: [code, reason]
+      description: >
+        Gateway close codes: 4400 protocol violation, 4401 token_expired,
+        4402 invalid_token, 4503 service_unavailable (retryable),
+        1001 going away (graceful shutdown).
+      properties:
+        code:
+          type: integer
+          description: WebSocket close code.
+          example: 4401
+        reason:
+          type: string
+          description: Stable machine-readable close reason, snake_case.
+          example: "token_expired"
