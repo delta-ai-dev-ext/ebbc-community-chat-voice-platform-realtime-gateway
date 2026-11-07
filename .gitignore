@@ -1,4 +1,7 @@
-server/
+# Local build output ("go build ./cmd/server" writes ./server). Anchored to the repository
+# root on purpose: an unanchored "server/" also matches the entrypoint package directory
+# cmd/server/ and would silently discard main.go.
+/server
 *.exe
 *.test
 *.out
